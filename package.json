@@ -1,0 +1,28 @@
+{
+  "name": "kantorai-foundation",
+  "version": "0.1.0",
+  "private": true,
+  "description": "KantorAI virtual office and multi-agent platform foundation",
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,worker,web -c green,magenta,cyan \"npm run dev -w @kantorai/api\" \"npm run dev:worker -w @kantorai/api\" \"npm run dev -w @kantorai/web\"",
+    "dev:api": "npm run dev -w @kantorai/api",
+    "dev:web": "npm run dev -w @kantorai/web",
+    "build": "npm run build -w @kantorai/api && npm run build -w @kantorai/web",
+    "db:generate": "npm run db:generate -w @kantorai/api",
+    "db:migrate": "npm run db:migrate -w @kantorai/api",
+    "db:seed": "npm run db:seed -w @kantorai/api",
+    "typecheck": "npm run typecheck -w @kantorai/api && npm run typecheck -w @kantorai/web",
+    "dev:worker": "npm run dev:worker -w @kantorai/api"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "dotenv-cli": "^8.0.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

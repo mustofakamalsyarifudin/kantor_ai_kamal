@@ -1,0 +1,235 @@
+// M4.1 — Dependencies and artifact handoff. The first subtask runs first; later subtasks wait for owner approval of its result.
+async function releaseManagerFollowups(completedChildId: string, workspaceId: string, actorId: string) {
+  const completedChild = await prisma.task.findFirst({ where: { id: completedChildId, workspaceId }, include: { assignedAgent: { select: { name: true, role: true } } } });
+  if (!completedChild?.parentTaskId || completedChild.status !== TaskStatus.COMPLETED) return { queuedCount: 0, warning: null as string | null };
+  const childMetadata = completedChild.metadata && typeof completedChild.metadata === "object" && !Array.isArray(completedChild.metadata)
+    ? completedChild.metadata as Record<string, unknown> : {};
+  if (Number(childMetadata.sequence || 0) !== 1) return { queuedCount: 0, warning: null as string | null };
+  const parent = await prisma.task.findFirst({ where: { id: completedChild.parentTaskId, workspaceId } });
+  if (!parent) return { queuedCount: 0, warning: "Tugas induk Manager AI tidak ditemukan; subtugas lanjutan belum diantrekan." };
+  const parentMetadata = parent.metadata && typeof parent.metadata === "object" && !Array.isArray(parent.metadata)
+    ? parent.metadata as Record<string, unknown> : {};
+  if (parentMetadata.managerPlan !== true) return { queuedCount: 0, warning: null as string | null };
+  const sourceArtifact = await prisma.artifact.findFirst({ where: { workspaceId, taskId: completedChild.id, mimeType: "text/markdown" }, orderBy: { createdAt: "desc" } });
+  if (!sourceArtifact) {
+    const warning = "Hasil tahap pertama belum memiliki artefak Markdown; subtugas berikutnya ditahan agar tidak berjalan tanpa konteks.";
+    await prisma.runEvent.create({ data: { taskId: parent.id, eventType: "manager.context_handoff_blocked", actorType: "SYSTEM", message: warning, payload: { completedChildId } } });
+    return { queuedCount: 0, warning };
+  }
+  const sourcePath = path.resolve(artifactRoot, sourceArtifact.storageKey);
+  const allowedPrefix = artifactRoot.endsWith(path.sep) ? artifactRoot : `${artifactRoot}${path.sep}`;
+  if (!sourcePath.startsWith(allowedPrefix)) return { queuedCount: 0, warning: "Lokasi artefak sumber tidak valid; subtugas berikutnya tidak diantrekan." };
+  let sourceContent = "";
+  try { sourceContent = (await fs.readFile(sourcePath, "utf8")).slice(0, 10000); }
+  catch (error) {
+    const warning = "Artefak analisis tidak dapat dibaca; subtugas berikutnya belum diantrekan.";
+    await prisma.runEvent.create({ data: { taskId: parent.id, eventType: "manager.context_handoff_blocked", actorType: "SYSTEM", message: warning, payload: { completedChildId, artifactId: sourceArtifact.id } } });
+    return { queuedCount: 0, warning };
+  }
+  const children = await prisma.task.findMany({ where: { workspaceId, parentTaskId: parent.id }, orderBy: { createdAt: "asc" } });
+  let queuedCount = 0;
+  for (const child of children) {
+    const metadata = child.metadata && typeof child.metadata === "object" && !Array.isArray(child.metadata)
+      ? child.metadata as Record<string, unknown> : {};
+    if (Number(metadata.sequence || 0) <= 1 || child.status !== TaskStatus.DRAFT) continue;
+    const contextBlock = `
+
+KONTEKS HASIL TAHAP PERTAMA — WAJIB DIGUNAKAN
+Agent sumber: ${completedChild.assignedAgent?.name || "agent"} (${completedChild.assignedAgent?.role || "spesialis AI"})
+Artefak sumber: ${sourceArtifact.name}
+Ringkasan/isi analisis yang telah disetujui pemilik:
+${sourceContent}
+
+Gunakan konteks ini secara eksplisit. Jangan mengarang temuan tambahan atau menyatakan bahwa sumber eksternal telah diverifikasi jika tidak ada buktinya.`;
+    const updated = await prisma.task.updateMany({
+      where: { id: child.id, workspaceId, status: TaskStatus.DRAFT },
+      data: {
+        instruction: `${child.instruction}${contextBlock}`,
+        metadata: { ...metadata, contextInjectedFromTaskId: completedChild.id, contextInjectedFromArtifactId: sourceArtifact.id, contextInjectedAt: new Date().toISOString() } as Prisma.InputJsonValue
+      }
+    });
+    if (updated.count !== 1) continue;
+    await prisma.runEvent.create({ data: { taskId: child.id, eventType: "manager.context_handoff_received", actorType: "MANAGER", message: `Konteks dari artefak “${sourceArtifact.name}” diteruskan sebelum subtugas dijalankan.`, payload: { sourceTaskId: completedChild.id, sourceArtifactId: sourceArtifact.id } } });
+    const queued = await queueTaskRecord(child.id, workspaceId, actorId, [TaskStatus.DRAFT]);
+    if (queued.status === TaskStatus.BLOCKED) continue;
+    queuedCount += 1;
+  }
+  await syncManagerPlanParentStatus(completedChild.id, workspaceId).catch(() => {});
+  emitWorkspace(workspaceId, "task.manager_context_handoff_completed", { parentTaskId: parent.id, sourceTaskId: completedChild.id, sourceArtifactId: sourceArtifact.id, queuedCount });
+  return { queuedCount, warning: null as string | null };
+}
+
+// M4.1 — Synthesis/review of saved specialist artifacts. This never auto-publishes.
+const managerReviewInFlight = new Set<string>();
+
+app.get<{ Params: { parentTaskId: string } }>("/api/manager/review/:parentTaskId", { preHandler: authenticate }, async (request, reply) => {
+  const workspaceId = workspaceIdOf(request);
+  const parent = await prisma.task.findFirst({ where: { id: request.params.parentTaskId, workspaceId } });
+  if (!parent) return reply.code(404).send({ error: "NOT_FOUND", message: "Tugas induk Manager AI tidak ditemukan." });
+  const metadata = parent.metadata && typeof parent.metadata === "object" && !Array.isArray(parent.metadata)
+    ? parent.metadata as Record<string, unknown> : {};
+  if (metadata.managerPlan !== true) return reply.code(400).send({ error: "NOT_MANAGER_PLAN", message: "Tugas ini bukan rencana induk Manager AI." });
+  const artifactId = typeof metadata.managerReviewArtifactId === "string" ? metadata.managerReviewArtifactId : "";
+  const artifact = artifactId ? await prisma.artifact.findFirst({ where: { id: artifactId, workspaceId, taskId: parent.id } }) : null;
+  return {
+    parentTaskId: parent.id,
+    parentStatus: parent.status,
+    reviewStatus: String(metadata.managerReviewStatus || "NOT_STARTED"),
+    readyForReview: parent.status === TaskStatus.REVIEW_REQUIRED,
+    artifact: artifact ? { ...artifact, sizeBytes: artifact.sizeBytes === null ? null : artifact.sizeBytes.toString() } : null,
+    sources: Array.isArray(metadata.managerReviewSources) ? metadata.managerReviewSources : [],
+    usage: metadata.managerReviewUsage || null,
+    message: artifact ? "Paket final Nara sudah tersimpan." : "Paket final belum dibuat. Pastikan semua subtugas sudah selesai dan disetujui."
+  };
+});
+
+app.post("/api/manager/review", { preHandler: authenticate }, async (request, reply) => {
+  const input = z.object({ parentTaskId: z.string().min(1) }).parse(request.body);
+  const workspaceId = workspaceIdOf(request);
+  const parent = await prisma.task.findFirst({ where: { id: input.parentTaskId, workspaceId } });
+  if (!parent) return reply.code(404).send({ error: "NOT_FOUND", message: "Tugas induk Manager AI tidak ditemukan." });
+  const metadata = parent.metadata && typeof parent.metadata === "object" && !Array.isArray(parent.metadata)
+    ? parent.metadata as Record<string, unknown> : {};
+  if (metadata.managerPlan !== true) return reply.code(400).send({ error: "NOT_MANAGER_PLAN", message: "Tugas ini bukan rencana induk Manager AI." });
+
+  const savedArtifactId = typeof metadata.managerReviewArtifactId === "string" ? metadata.managerReviewArtifactId : "";
+  if (savedArtifactId) {
+    const savedArtifact = await prisma.artifact.findFirst({ where: { id: savedArtifactId, workspaceId, taskId: parent.id } });
+    if (savedArtifact) return reply.code(200).send({
+      parentTaskId: parent.id, alreadyExists: true,
+      artifact: { ...savedArtifact, sizeBytes: savedArtifact.sizeBytes === null ? null : savedArtifact.sizeBytes.toString() },
+      sources: Array.isArray(metadata.managerReviewSources) ? metadata.managerReviewSources : [],
+      usage: metadata.managerReviewUsage || null,
+      message: "Paket final sudah dibuat sebelumnya; tidak ada pemanggilan OpenAI tambahan."
+    });
+  }
+  if (managerReviewInFlight.has(parent.id)) return reply.code(409).send({ error: "MANAGER_REVIEW_IN_PROGRESS", message: "Nara sedang menyusun review final untuk rencana ini. Tunggu proses saat ini selesai." });
+  if (executorMode !== "openai" || !openAiConfigured) return reply.code(409).send({ error: "OPENAI_EXECUTOR_REQUIRED", message: "Executor OpenAI belum aktif; review final tidak dijalankan." });
+
+  const children = await prisma.task.findMany({
+    where: { workspaceId, parentTaskId: parent.id },
+    include: {
+      assignedAgent: { select: { id: true, name: true, role: true } },
+      artifacts: { orderBy: { createdAt: "desc" }, select: { id: true, name: true, mimeType: true, storageKey: true, metadata: true, createdAt: true } }
+    },
+    orderBy: { createdAt: "asc" }
+  });
+  if (children.length < 2) return reply.code(409).send({ error: "MANAGER_REVIEW_NO_SUBTASKS", message: "Rencana belum memiliki cukup subtugas untuk disintesis." });
+  const unfinished = children.filter(child => child.status !== TaskStatus.COMPLETED);
+  if (unfinished.length) return reply.code(409).send({
+    error: "MANAGER_REVIEW_CHILDREN_PENDING",
+    message: `Selesaikan review manusia terlebih dahulu. Subtugas belum disetujui selesai: ${unfinished.map(child => `${child.title} (${child.status})`).join(", ")}.`
+  });
+
+  const sourceDocs: Array<{ taskId: string; title: string; agentName: string; agentRole: string; artifactId: string; artifactName: string; content: string }> = [];
+  for (const child of children) {
+    const sourceArtifact = child.artifacts.find(item => item.mimeType === "text/markdown" || item.name.toLowerCase().endsWith(".md"));
+    if (!sourceArtifact) return reply.code(409).send({ error: "MANAGER_REVIEW_ARTIFACT_MISSING", message: `Artefak Markdown untuk subtugas “${child.title}” belum ditemukan.` });
+    const filePath = path.resolve(artifactRoot, sourceArtifact.storageKey);
+    const allowedPrefix = artifactRoot.endsWith(path.sep) ? artifactRoot : `${artifactRoot}${path.sep}`;
+    if (!filePath.startsWith(allowedPrefix)) return reply.code(400).send({ error: "INVALID_ARTIFACT_PATH", message: "Path artefak sumber tidak valid." });
+    let content: string;
+    try { content = await fs.readFile(filePath, "utf8"); }
+    catch (error) {
+      request.log.warn({ err: error, artifactId: sourceArtifact.id, taskId: child.id }, "Artefak sumber review Manager AI tidak dapat dibaca");
+      return reply.code(409).send({ error: "MANAGER_REVIEW_ARTIFACT_UNREADABLE", message: `File hasil untuk subtugas “${child.title}” tidak dapat dibaca dari penyimpanan lokal.` });
+    }
+    sourceDocs.push({
+      taskId: child.id, title: child.title,
+      agentName: child.assignedAgent?.name || "Agent tidak diketahui",
+      agentRole: child.assignedAgent?.role || "Spesialis AI",
+      artifactId: sourceArtifact.id, artifactName: sourceArtifact.name,
+      content: content.slice(0, 12000)
+    });
+  }
+
+  managerReviewInFlight.add(parent.id);
+  const startedAt = new Date().toISOString();
+  const sourceInfo = sourceDocs.map(({ taskId, title, agentName, agentRole, artifactId, artifactName }) => ({ taskId, title, agentName, agentRole, artifactId, artifactName }));
+  let filePathToCleanup = "";
+  try {
+    await prisma.task.update({
+      where: { id: parent.id },
+      data: { metadata: { ...metadata, managerReviewStatus: "RUNNING", managerReviewStartedAt: startedAt } as Prisma.InputJsonValue }
+    });
+    await prisma.runEvent.create({ data: { taskId: parent.id, eventType: "manager.final_review_started", actorType: "MANAGER", message: "Nara mulai menyintesis artefak subtugas yang telah disetujui.", payload: { childTaskCount: sourceDocs.length, sourceTaskIds: sourceDocs.map(source => source.taskId) } } });
+
+    const client = new OpenAI({ apiKey: openAiApiKey, timeout: 90000, maxRetries: 1 });
+    const response = await client.responses.create({
+      model: openAiModel,
+      instructions: [
+        "Anda adalah Nara, AI Operations Manager KantorAI. Anda sedang melakukan final review atas hasil agent spesialis yang telah selesai dan disetujui manusia.",
+        "Gunakan isi artefak yang diberikan sebagai satu-satunya sumber untuk merangkum pekerjaan. Jangan mengaku melakukan riset eksternal, memeriksa basis data merek, atau memverifikasi hukum jika artefak tidak membuktikannya.",
+        "Susun dokumen Markdown Bahasa Indonesia yang benar-benar mengintegrasikan hasil, bukan sekadar menyalin seluruh artefak. Pertahankan poin penting dan deliverable utama.",
+        "Struktur wajib: (1) Ringkasan eksekutif; (2) Temuan audiens dan rekomendasi konten; (3) Outline carousel final secara ringkas per slide; (4) Naskah video final dengan durasi/adegan/voice-over; (5) Pemeriksaan konsistensi antara carousel dan video; (6) Daftar klaim atau istilah hukum yang wajib diverifikasi manusia dengan sumber resmi; (7) Checklist persetujuan sebelum publikasi; (8) Daftar sumber artefak yang digunakan beserta nama agent.",
+        "Jika dua artefak berbeda, tandai perbedaan dan sarankan penyelesaian; jangan diam-diam mengarang jawaban. Materi KI/hukum adalah edukasi umum, bukan nasihat hukum personal. Jangan melakukan publikasi atau tindakan eksternal. Nyatakan bahwa hasil akhir masih perlu pemeriksaan manusia."
+      ].join("\n\n"),
+      input: JSON.stringify({
+        packageTitle: parent.title,
+        userGoal: parent.instruction,
+        managerPlanSummary: metadata.planSummary || "",
+        sourceDeliverables: sourceDocs.map(source => ({
+          taskId: source.taskId, taskTitle: source.title, agent: source.agentName,
+          role: source.agentRole, artifact: source.artifactName, content: source.content
+        }))
+      }),
+      max_output_tokens: Math.max(1800, Math.min(7000, Number(process.env.MANAGER_REVIEW_MAX_OUTPUT_TOKENS || 4500))),
+      store: false
+    });
+    const output = response.output_text?.trim();
+    if (!output) throw new Error("Nara tidak menghasilkan isi review final.");
+    const finishedAt = new Date();
+    const safeBase = parent.title.normalize("NFKD").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 55) || "paket-konten";
+    const fileName = `${safeBase}-review-final-${Date.now()}.md`;
+    filePathToCleanup = path.resolve(artifactRoot, fileName);
+    await fs.mkdir(artifactRoot, { recursive: true });
+    const finalMarkdown = `# Review Final — ${parent.title}\n\n> Disusun oleh Nara melalui OpenAI Responses API pada ${finishedAt.toISOString()}. Dokumen ini adalah sintesis dari artefak subtugas yang tersedia dan tetap memerlukan pemeriksaan manusia.\n\n${output}\n`;
+    await fs.writeFile(filePathToCleanup, finalMarkdown, { flag: "wx" });
+    const storageKey = path.relative(artifactRoot, filePathToCleanup).split(path.sep).join("/");
+    const usage = {
+      inputTokens: response.usage?.input_tokens ?? null,
+      outputTokens: response.usage?.output_tokens ?? null,
+      totalTokens: response.usage?.total_tokens ?? null
+    };
+    const result = await prisma.$transaction(async tx => {
+      const artifact = await tx.artifact.create({
+        data: {
+          workspaceId, taskId: parent.id, runId: null,
+          name: fileName, mimeType: "text/markdown", storageKey,
+          sizeBytes: BigInt(Buffer.byteLength(finalMarkdown, "utf8")),
+          metadata: { artifactType: "manager.final-review", provider: "openai", model: response.model || openAiModel, responseId: response.id, sourceArtifacts: sourceInfo, usage } as Prisma.InputJsonValue
+        }
+      });
+      const nextMetadata = {
+        ...metadata,
+        managerReviewStatus: "GENERATED",
+        managerReviewArtifactId: artifact.id,
+        managerReviewArtifactName: fileName,
+        managerReviewGeneratedAt: finishedAt.toISOString(),
+        managerReviewModel: response.model || openAiModel,
+        managerReviewUsage: usage,
+        managerReviewSources: sourceInfo
+      } as Prisma.InputJsonValue;
+      const updatedParent = await tx.task.update({ where: { id: parent.id }, data: { metadata: nextMetadata } });
+      await tx.runEvent.create({ data: { taskId: parent.id, eventType: "manager.final_review_generated", actorType: "MANAGER", message: "Nara menyimpan dokumen review final berdasarkan artefak seluruh subtugas.", payload: { artifactId: artifact.id, artifactName: fileName, sourceTaskIds: sourceDocs.map(source => source.taskId), usage } } });
+      await tx.auditLog.create({ data: { workspaceId, actorId: request.user.sub, action: "manager.final_review_generated", entityType: "task", entityId: parent.id, metadata: { artifactId: artifact.id, sourceTaskIds: sourceDocs.map(source => source.taskId), model: response.model || openAiModel, usage } as Prisma.InputJsonValue } });
+      return { parent: updatedParent, artifact };
+    });
+    emitWorkspace(workspaceId, "task.manager_final_review_generated", { parentTaskId: parent.id, artifactId: result.artifact.id, sourceTaskIds: sourceDocs.map(source => source.taskId) });
+    return reply.code(201).send({
+      parentTaskId: parent.id, alreadyExists: false,
+      artifact: { ...result.artifact, sizeBytes: result.artifact.sizeBytes === null ? null : result.artifact.sizeBytes.toString() },
+      sources: sourceInfo, usage,
+      message: "Review final berhasil dibuat dan disimpan. Tidak ada publikasi yang dilakukan."
+    });
+  } catch (error) {
+    const message = safeProviderError(error);
+    await prisma.task.update({ where: { id: parent.id }, data: { metadata: { ...metadata, managerReviewStatus: "FAILED", managerReviewLastError: message } as Prisma.InputJsonValue } }).catch(updateError => request.log.warn({ err: updateError }, "Status review Manager AI gagal dipulihkan"));
+    if (filePathToCleanup) await fs.rm(filePathToCleanup, { force: true }).catch(() => {});
+    request.log.warn({ err: error, parentTaskId: parent.id }, "Review final Manager AI gagal");
+    return reply.code(502).send({ error: "MANAGER_REVIEW_FAILED", message });
+  } finally {
+    managerReviewInFlight.delete(parent.id);
+  }
+});
+

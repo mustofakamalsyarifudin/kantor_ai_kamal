@@ -1,0 +1,248 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AgentState {
+  IDLE
+  THINKING
+  WORKING
+  USING_TOOL
+  WAITING_APPROVAL
+  COMPLETED
+  ERROR
+  DISABLED
+}
+
+enum TaskStatus {
+  DRAFT
+  QUEUED
+  PLANNING
+  RUNNING
+  REVIEW_REQUIRED
+  COMPLETED
+  PAUSED
+  FAILED
+  CANCELLED
+  BLOCKED
+}
+
+enum TaskPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum RunStatus {
+  STARTED
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  name         String
+  passwordHash String
+  active       Boolean   @default(true)
+  workspace    Workspace?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+model Workspace {
+  id          String       @id @default(cuid())
+  name        String
+  slug        String       @unique
+  ownerId     String       @unique
+  owner       User         @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  departments Department[]
+  agents      Agent[]
+  tasks       Task[]
+  runs        AgentRun[]
+  artifacts   Artifact[]
+  approvals   Approval[]
+  auditLogs   AuditLog[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+}
+
+model Department {
+  id          String    @id @default(cuid())
+  workspaceId String
+  code        String
+  name        String
+  description String?
+  sortOrder   Int       @default(0)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  agents      Agent[]
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([workspaceId, code])
+  @@index([workspaceId, sortOrder])
+}
+
+model Agent {
+  id           String     @id @default(cuid())
+  workspaceId  String
+  departmentId String?
+  slug         String
+  name         String
+  role         String
+  description  String?
+  systemPrompt String?
+  provider     String?
+  model        String?
+  state        AgentState @default(IDLE)
+  enabled      Boolean    @default(true)
+  allowedTools String[]   @default([])
+  dailyBudget  Decimal?   @db.Decimal(10, 2)
+  visualConfig Json?
+  workspace    Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  department   Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  tasks        Task[]
+  runs         AgentRun[]
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  @@unique([workspaceId, slug])
+  @@index([workspaceId, departmentId])
+  @@index([workspaceId, enabled, state])
+}
+
+model Task {
+  id              String       @id @default(cuid())
+  workspaceId     String
+  assignedAgentId String?
+  parentTaskId    String?
+  title           String
+  instruction     String
+  status          TaskStatus   @default(DRAFT)
+  priority        TaskPriority @default(NORMAL)
+  dueAt           DateTime?
+  metadata        Json?
+  workspace       Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  assignedAgent   Agent?        @relation(fields: [assignedAgentId], references: [id], onDelete: SetNull)
+  parentTask      Task?         @relation("TaskHierarchy", fields: [parentTaskId], references: [id], onDelete: SetNull)
+  subtasks        Task[]        @relation("TaskHierarchy")
+  runs            AgentRun[]
+  runEvents       RunEvent[]
+  artifacts       Artifact[]
+  approvals       Approval[]
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([workspaceId, status, createdAt])
+  @@index([workspaceId, assignedAgentId, status])
+  @@index([parentTaskId])
+}
+
+model AgentRun {
+  id           String    @id @default(cuid())
+  workspaceId  String
+  taskId       String
+  agentId      String
+  status       RunStatus @default(STARTED)
+  provider     String?
+  model        String?
+  input        Json?
+  output       Json?
+  errorMessage String?
+  startedAt    DateTime  @default(now())
+  finishedAt   DateTime?
+  workspace    Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  task         Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  agent        Agent     @relation(fields: [agentId], references: [id], onDelete: Restrict)
+  events       RunEvent[]
+  artifacts    Artifact[]
+  createdAt    DateTime  @default(now())
+
+  @@index([workspaceId, status, startedAt])
+  @@index([taskId, startedAt])
+  @@index([agentId, startedAt])
+}
+
+model RunEvent {
+  id        String   @id @default(cuid())
+  taskId    String
+  runId     String?
+  eventType String
+  actorType String   @default("SYSTEM")
+  message   String?
+  payload   Json?
+  createdAt DateTime @default(now())
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  run       AgentRun? @relation(fields: [runId], references: [id], onDelete: SetNull)
+
+  @@index([taskId, createdAt])
+  @@index([runId, createdAt])
+}
+
+model Artifact {
+  id          String    @id @default(cuid())
+  workspaceId String
+  taskId      String?
+  runId       String?
+  name        String
+  mimeType    String
+  storageKey  String
+  sizeBytes   BigInt?
+  metadata    Json?
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  task        Task?     @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  run         AgentRun? @relation(fields: [runId], references: [id], onDelete: SetNull)
+  createdAt   DateTime  @default(now())
+
+  @@index([workspaceId, createdAt])
+  @@index([taskId])
+  @@index([runId])
+}
+
+model Approval {
+  id             String         @id @default(cuid())
+  workspaceId    String
+  taskId         String?
+  actionType     String
+  status         ApprovalStatus  @default(PENDING)
+  summary        String
+  payload        Json
+  requestedBy    String?
+  resolvedBy     String?
+  resolvedAt     DateTime?
+  expiresAt      DateTime?
+  workspace      Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  task           Task?          @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  @@index([workspaceId, status, createdAt])
+}
+
+model AuditLog {
+  id          String    @id @default(cuid())
+  workspaceId String
+  actorId     String?
+  action      String
+  entityType  String
+  entityId    String?
+  metadata    Json?
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdAt   DateTime  @default(now())
+
+  @@index([workspaceId, createdAt])
+  @@index([entityType, entityId])
+}
